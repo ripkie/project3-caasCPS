@@ -1,0 +1,7 @@
+{
+    "name": "edge-impulse",
+    "version": "1.0.0",
+    "build": {
+        "srcDir": "src"
+    }
+}
