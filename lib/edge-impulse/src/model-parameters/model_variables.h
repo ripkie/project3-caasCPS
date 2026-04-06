@@ -150,7 +150,7 @@ const ei_impulse_t impulse_947452_1 = {
     .project_name = "ripki-project-1",
     .impulse_id = 1,
     .impulse_name = "Impulse #1",
-    .deploy_version = 1,
+    .deploy_version = 3,
 
     .nn_input_frame_size = 39,
     .raw_sample_count = 10,
