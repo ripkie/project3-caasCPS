@@ -1,74 +1,51 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <math.h>
-
 #include "edge-impulse-sdk/classifier/ei_run_classifier.h"
 #include "model-parameters/model_metadata.h"
-#include "model-parameters/model_variables.h"
 
 // =========================
-// KONFIGURASI PIN
+// KONFIGURASI
 // =========================
-#define SDA_PIN 17
-#define SCL_PIN 18
+#define SDA_PIN 8
+#define SCL_PIN 9
 #define MPU_ADDR 0x68
 
-// =========================
-// REGISTER MPU
-// =========================
-#define REG_PWR_MGMT_1 0x6B
-#define REG_ACCEL_XOUT_H 0x3B
-#define REG_ACCEL_CONFIG 0x1C
-#define REG_WHO_AM_I 0x75
+#define SAMPLE_INTERVAL_MS  20      // 50 Hz
+#define FALL_COOLDOWN_MS    5000    // 5 detik (bisa diubah)
+#define FALL_THRESHOLD      0.85    // Naikkan jadi 0.88 atau 0.90 kalau masih sering false positive
+
+// Buffer Edge Impulse
+static float input_buffer[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE] = {0};
+static size_t input_ix = 0;
+
+// Cooldown
+unsigned long lastFallTime = 0;
+bool inCooldown = false;
 
 // =========================
-// PARAMETER INFERENSI
+// FUNGSI I2C MPU6050
 // =========================
-static const uint32_t SAMPLE_INTERVAL_MS = 50; // 20 Hz
-static const size_t AXIS_COUNT = 3;
-static const size_t SAMPLE_COUNT = 10; // 500 ms @ 20 Hz
-static const size_t INPUT_FRAME_SIZE = SAMPLE_COUNT * AXIS_COUNT;
-
-float input_buffer[INPUT_FRAME_SIZE];
-size_t input_ix = 0;
-unsigned long lastSampleTime = 0;
-
-// =========================
-// I2C FUNCTIONS
-// =========================
-void writeRegister(uint8_t reg, uint8_t value)
-{
+void writeRegister(uint8_t reg, uint8_t value) {
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(reg);
   Wire.write(value);
   Wire.endTransmission();
 }
 
-uint8_t readRegister(uint8_t reg)
-{
+uint8_t readRegister(uint8_t reg) {
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(reg);
   Wire.endTransmission(false);
-
   Wire.requestFrom(MPU_ADDR, 1);
-  if (Wire.available())
-  {
-    return Wire.read();
-  }
-  return 0xFF;
+  return Wire.available() ? Wire.read() : 0xFF;
 }
 
-void readAccelRaw(int16_t &ax, int16_t &ay, int16_t &az)
-{
-  ax = ay = az = 0;
-
+void readAccelRaw(int16_t &ax, int16_t &ay, int16_t &az) {
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(REG_ACCEL_XOUT_H);
+  Wire.write(0x3B);
   Wire.endTransmission(false);
-
   Wire.requestFrom(MPU_ADDR, 6);
-  if (Wire.available() >= 6)
-  {
+  if (Wire.available() >= 6) {
     ax = (Wire.read() << 8) | Wire.read();
     ay = (Wire.read() << 8) | Wire.read();
     az = (Wire.read() << 8) | Wire.read();
@@ -76,39 +53,28 @@ void readAccelRaw(int16_t &ax, int16_t &ay, int16_t &az)
 }
 
 // =========================
-// INIT MPU
+// INIT MPU6050
 // =========================
-bool initMPU()
-{
-  uint8_t whoami = readRegister(REG_WHO_AM_I);
-  Serial.print("WHO_AM_I = 0x");
-  Serial.println(whoami, HEX);
-
-  if (whoami != 0x70 && whoami != 0x71 && whoami != 0x73)
-  {
-    Serial.println("MPU tidak terdeteksi!");
+bool initMPU() {
+  uint8_t whoami = readRegister(0x75);
+  Serial.printf("WHO_AM_I = 0x%02X\n", whoami);
+  
+  if (whoami != 0x68 && whoami != 0x70 && whoami != 0x71 && whoami != 0x72 && whoami != 0x73) {
+    Serial.println("MPU6050 tidak terdeteksi!");
     return false;
   }
-
-  writeRegister(REG_PWR_MGMT_1, 0x00); // wake up
+  writeRegister(0x6B, 0x00);
   delay(100);
-
-  writeRegister(REG_ACCEL_CONFIG, 0x00); // +-2g
+  writeRegister(0x1C, 0x00);
   delay(50);
-
+  Serial.println("MPU6050 initialized.");
   return true;
 }
 
 // =========================
-// EDGE IMPULSE SIGNAL
+// SIGNAL CALLBACK
 // =========================
-static int get_signal_data(size_t offset, size_t length, float *out_ptr)
-{
-  if ((offset + length) > INPUT_FRAME_SIZE)
-  {
-    return -1;
-  }
-
+static int get_signal_data(size_t offset, size_t length, float *out_ptr) {
   memcpy(out_ptr, input_buffer + offset, length * sizeof(float));
   return 0;
 }
@@ -116,119 +82,106 @@ static int get_signal_data(size_t offset, size_t length, float *out_ptr)
 // =========================
 // RUN INFERENCE
 // =========================
-void runInference()
-{
+void runInference() {
   signal_t signal;
-  signal.total_length = INPUT_FRAME_SIZE;
-  signal.get_data = get_signal_data;
+  signal.total_length = EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE;
+  signal.get_data = &get_signal_data;
 
   ei_impulse_result_t result = {0};
-
   EI_IMPULSE_ERROR res = run_classifier(&signal, &result, false);
-  if (res != EI_IMPULSE_OK)
-  {
-    Serial.print("run_classifier error: ");
-    Serial.println((int)res);
+
+  if (res != EI_IMPULSE_OK) {
+    Serial.printf("Classifier error: %d\n", res);
     return;
   }
 
+  Serial.println("\n=== HASIL INFERENSI ===");
+  float fallConfidence = 0.0f;
+  const char* bestLabel = "Unknown";
   float bestValue = 0.0f;
-  const char *bestLabel = "Unknown";
 
-  Serial.println("=== HASIL INFERENSI ===");
-  for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++)
-  {
-    const char *label = result.classification[ix].label;
-    float value = result.classification[ix].value;
+  for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+    const char* label = result.classification[i].label;
+    float value = result.classification[i].value;
+    Serial.printf("%s: %.5f\n", label, value);
 
-    Serial.print(label);
-    Serial.print(": ");
-    Serial.println(value, 5);
-
-    if (value > bestValue)
-    {
+    if (value > bestValue) {
       bestValue = value;
       bestLabel = label;
     }
+    if (strstr(label, "fall") || strstr(label, "Fall") || strstr(label, "jatuh")) {
+      fallConfidence = value;   // simpan nilai Fall
+    }
   }
 
-  Serial.print("Prediksi: ");
-  if (bestValue >= 0.60f)
-  {
-    Serial.print(bestLabel);
+  Serial.printf("Prediksi: %s (%.1f%%)\n", bestLabel, bestValue * 100);
+  Serial.printf("Fall confidence: %.1f%%\n", fallConfidence * 100);
+
+  // ==================== TRIGGER COOLDOWN HANYA SAAT FALL BENAR-BENAR TINGGI ====================
+  if (fallConfidence >= FALL_THRESHOLD) {
+    Serial.println("🚨 FALL DETECTED! Ambil tindakan...");
+    lastFallTime = millis();
+    inCooldown = true;
   }
-  else
-  {
-    Serial.print("Unknown");
-  }
-  Serial.print(" (confidence=");
-  Serial.print(bestValue, 5);
-  Serial.println(")");
+
   Serial.println("======================");
 }
 
 // =========================
 // SETUP
 // =========================
-void setup()
-{
+void setup() {
   Serial.begin(115200);
-  delay(1500);
+  delay(2000);
 
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(400000);
 
-  Serial.println("=== ESP32-S3 EDGE IMPULSE INFERENCE ===");
+  Serial.println("=== Wearable Fall Detection - Cooldown HANYA Saat Fall ===");
 
-  if (!initMPU())
-  {
-    while (1)
-    {
-      delay(1000);
-    }
+  if (!initMPU()) {
+    while (1) delay(1000);
   }
 
-  Serial.print("EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE = ");
-  Serial.println(EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE);
-
-  if (EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE != INPUT_FRAME_SIZE)
-  {
-    Serial.println("Ukuran input model tidak cocok!");
-    Serial.println("Cek lagi window size, frequency, atau jumlah axis di Edge Impulse.");
-    while (1)
-    {
-      delay(1000);
-    }
-  }
-
-  Serial.println("Sistem siap.");
+  Serial.printf("Model input size: %d\n", EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE);
+  Serial.printf("Fall threshold: %.2f\n", FALL_THRESHOLD);
+  Serial.println("Sistem siap.\n");
 }
 
 // =========================
-// LOOP
+// LOOP - Cooldown hanya saat Fall
 // =========================
-void loop()
-{
+void loop() {
   unsigned long now = millis();
-  if (now - lastSampleTime < SAMPLE_INTERVAL_MS)
-  {
-    return;
-  }
-  lastSampleTime = now;
 
-  int16_t axRaw = 0, ayRaw = 0, azRaw = 0;
+  // Cooldown check
+  if (inCooldown) {
+    if (now - lastFallTime >= FALL_COOLDOWN_MS) {
+      inCooldown = false;
+      Serial.println("Cooldown selesai → kembali normal...");
+    } else {
+      delay(SAMPLE_INTERVAL_MS);   // tetap sampling tapi tidak inference
+      return;
+    }
+  }
+
+  // Normal operation (selalu inference kecuali cooldown)
+  static unsigned long lastSample = 0;
+  if (now - lastSample < SAMPLE_INTERVAL_MS) return;
+  lastSample = now;
+
+  int16_t axRaw, ayRaw, azRaw;
   readAccelRaw(axRaw, ayRaw, azRaw);
 
-  float axG = axRaw / 16384.0f;
-  float ayG = ayRaw / 16384.0f;
-  float azG = azRaw / 16384.0f;
+  float ax = axRaw / 16384.0f;
+  float ay = ayRaw / 16384.0f;
+  float az = azRaw / 16384.0f;
 
-  input_buffer[input_ix++] = axG;
-  input_buffer[input_ix++] = ayG;
-  input_buffer[input_ix++] = azG;
+  input_buffer[input_ix++] = ax;
+  input_buffer[input_ix++] = ay;
+  input_buffer[input_ix++] = az;
 
-  if (input_ix >= INPUT_FRAME_SIZE)
-  {
+  if (input_ix >= EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE) {
     runInference();
     input_ix = 0;
   }
