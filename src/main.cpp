@@ -10,9 +10,6 @@
 #define SCL_PIN 9
 #define MPU_ADDR 0x68
 
-#define LED_PIN 2    // LED built-in ESP32-S3 (ganti sesuai board)
-#define BUZZER_PIN 4 // Pin buzzer aktif (ganti sesuai wiring)
-
 // =========================
 // KONFIGURASI DETEKSI
 // =========================
@@ -106,17 +103,6 @@ static bool initMPU()
 static void triggerFallAlert()
 {
   Serial.println("🚨 [ALERT] FALL DETECTED!");
-
-  for (int i = 0; i < BUZZER_REPEAT; i++)
-  {
-    digitalWrite(LED_PIN, HIGH);
-    digitalWrite(BUZZER_PIN, HIGH);
-    delay(BUZZER_BEEP_MS);
-
-    digitalWrite(LED_PIN, LOW);
-    digitalWrite(BUZZER_PIN, LOW);
-    delay(BUZZER_PAUSE_MS);
-  }
 }
 
 // SIGNAL CALLBACK (Edge Impulse)
@@ -187,12 +173,6 @@ void setup()
   Serial.begin(115200);
   delay(2000);
 
-  // Init pin output
-  pinMode(LED_PIN, OUTPUT);
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
-  digitalWrite(BUZZER_PIN, LOW);
-
   // Init I2C
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(400000);
@@ -205,21 +185,6 @@ void setup()
   Serial.printf("  Fall threshold: %.2f\n", FALL_THRESHOLD);
   Serial.printf("  Cooldown     : %d ms\n", FALL_COOLDOWN_MS);
   Serial.println("============================================\n");
-
-  if (!initMPU())
-  {
-    // Blink cepat tanda error, tidak lanjut
-    while (true)
-    {
-      digitalWrite(LED_PIN, !digitalRead(LED_PIN));
-      delay(200);
-    }
-  }
-
-  // Indikator siap: LED nyala 1 detik
-  digitalWrite(LED_PIN, HIGH);
-  delay(1000);
-  digitalWrite(LED_PIN, LOW);
 
   Serial.println("[SYS] Sistem siap. Mulai monitoring...\n");
 }
@@ -236,15 +201,7 @@ void loop()
     if (elapsed >= FALL_COOLDOWN_MS)
     {
       inCooldown = false;
-      digitalWrite(LED_PIN, LOW);
       Serial.println("[SYS] Cooldown selesai → kembali monitoring...\n");
-    }
-    else
-    {
-      // LED berkedip pelan selama cooldown
-      digitalWrite(LED_PIN, (elapsed / 500) % 2);
-      delay(SAMPLE_INTERVAL_MS);
-      return;
     }
   }
 
