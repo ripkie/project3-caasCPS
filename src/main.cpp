@@ -3,41 +3,22 @@
 #include "edge-impulse-sdk/classifier/ei_run_classifier.h"
 #include "model-parameters/model_metadata.h"
 
-// =========================
-// KONFIGURASI PIN
-// =========================
+// === KONFIGURASI ===
 #define SDA_PIN 8
 #define SCL_PIN 9
 #define MPU_ADDR 0x68
+#define SAMPLE_INTERVAL_MS 20 // 50Hz
+#define FALL_COOLDOWN_MS 2000
+#define FALL_THRESHOLD 0.85f // Confidence minimum untuk deteksi fall
 
-// =========================
-// KONFIGURASI DETEKSI
-// =========================
-#define SAMPLE_INTERVAL_MS 20 // 50 Hz sampling
-#define FALL_COOLDOWN_MS 3000 // Cooldown 5 detik setelah fall terdeteksi
-#define FALL_THRESHOLD 0.85f  // Naikkan ke 0.88-0.90 jika masih false positive
-
-// Durasi notifikasi buzzer & LED (ms)
-#define BUZZER_BEEP_MS 200
-#define BUZZER_PAUSE_MS 100
-#define BUZZER_REPEAT 3 // Jumlah beep saat fall detected
-
-// =========================
-// BUFFER EDGE IMPULSE
-// =========================
+// === BUFFER & STATE ===
 static float input_buffer[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE] = {0};
 static size_t input_ix = 0;
-
-// =========================
-// STATE VARIABLES
-// =========================
 static unsigned long lastFallTime = 0;
 static unsigned long lastSampleTime = 0;
 static bool inCooldown = false;
 
-// =========================
-// FUNGSI I2C MPU6050
-// =========================
+// === MPU6050 ===
 static void writeRegister(uint8_t reg, uint8_t value)
 {
   Wire.beginTransmission(MPU_ADDR);
@@ -55,7 +36,7 @@ static uint8_t readRegister(uint8_t reg)
   return Wire.available() ? Wire.read() : 0xFF;
 }
 
-static bool readAccelRaw(float &ax, float &ay, float &az)
+static bool readAccel(float &ax, float &ay, float &az)
 {
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x3B);
@@ -65,28 +46,22 @@ static bool readAccelRaw(float &ax, float &ay, float &az)
   if (Wire.available() < 6)
     return false;
 
-  int16_t rawX = (Wire.read() << 8) | Wire.read();
-  int16_t rawY = (Wire.read() << 8) | Wire.read();
-  int16_t rawZ = (Wire.read() << 8) | Wire.read();
-
-  // Konversi ke g (±2g range → 16384 LSB/g)
-  ax = rawX / 16384.0f;
-  ay = rawY / 16384.0f;
-  az = rawZ / 16384.0f;
+  // Baca raw 16-bit lalu konversi ke satuan g (range ±2g = 16384 LSB/g)
+  ax = (int16_t)((Wire.read() << 8) | Wire.read()) / 16384.0f;
+  ay = (int16_t)((Wire.read() << 8) | Wire.read()) / 16384.0f;
+  az = (int16_t)((Wire.read() << 8) | Wire.read()) / 16384.0f;
   return true;
 }
 
-// INIT MPU6050
 static bool initMPU()
 {
   uint8_t whoami = readRegister(0x75);
   Serial.printf("[MPU] WHO_AM_I = 0x%02X\n", whoami);
 
-  // WHO_AM_I valid untuk MPU6050/6500 series
   if (whoami != 0x68 && whoami != 0x70 &&
       whoami != 0x71 && whoami != 0x72 && whoami != 0x73)
   {
-    Serial.println("[MPU] ERROR: Sensor tidak terdeteksi! Cek wiring SDA/SCL.");
+    Serial.println("[MPU] ERROR: Sensor tidak terdeteksi!");
     return false;
   }
 
@@ -95,24 +70,17 @@ static bool initMPU()
   writeRegister(0x1C, 0x00); // Accel range ±2g
   delay(50);
 
-  Serial.println("[MPU] Initialized OK.");
+  Serial.println("[MPU] OK");
   return true;
 }
 
-// NOTIFIKASI FALL
-static void triggerFallAlert()
-{
-  Serial.println("🚨 [ALERT] FALL DETECTED!");
-}
-
-// SIGNAL CALLBACK (Edge Impulse)
+// === EDGE IMPULSE ===
 static int get_signal_data(size_t offset, size_t length, float *out_ptr)
 {
   memcpy(out_ptr, input_buffer + offset, length * sizeof(float));
   return EIDSP_OK;
 }
 
-// RUN INFERENCE
 static void runInference()
 {
   signal_t signal;
@@ -124,12 +92,11 @@ static void runInference()
 
   if (err != EI_IMPULSE_OK)
   {
-    Serial.printf("[EI] Classifier error: %d\n", err);
+    Serial.printf("[EI] Error: %d\n", err);
     return;
   }
 
-  // --- Cetak semua label ---
-  Serial.println("\n=== HASIL INFERENSI ===");
+  Serial.println("\n=== INFERENSI ===");
   float fallConfidence = 0.0f;
   const char *bestLabel = "Unknown";
   float bestValue = 0.0f;
@@ -138,92 +105,91 @@ static void runInference()
   {
     const char *label = result.classification[i].label;
     float value = result.classification[i].value;
-    Serial.printf("  %-12s : %.4f (%.1f%%)\n", label, value, value * 100.0f);
+    Serial.printf("  %-12s : %.1f%%\n", label, value * 100.0f);
 
     if (value > bestValue)
     {
       bestValue = value;
       bestLabel = label;
     }
-
-    // Deteksi label fall (case-insensitive workaround)
     if (strstr(label, "fall") || strstr(label, "Fall") || strstr(label, "jatuh"))
     {
       fallConfidence = value;
     }
   }
 
-  Serial.printf("  → Prediksi: %s (%.1f%%)\n", bestLabel, bestValue * 100.0f);
-  Serial.printf("  → Fall confidence: %.1f%%\n", fallConfidence * 100.0f);
+  Serial.printf("  Prediksi : %s (%.1f%%)\n", bestLabel, bestValue * 100.0f);
 
-  // --- Trigger jika fall confidence tinggi ---
   if (fallConfidence >= FALL_THRESHOLD)
   {
-    triggerFallAlert();
+    Serial.println("  !! FALL DETECTED !!");
     lastFallTime = millis();
     inCooldown = true;
   }
-
-  Serial.println("=======================\n");
+  Serial.println("=================\n");
 }
 
-// SETUP
+// === SETUP ===
 void setup()
 {
   Serial.begin(115200);
   delay(2000);
 
-  // Init I2C
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(400000);
 
-  Serial.println("============================================");
-  Serial.println("  Wearable Fall Detection - ESP32-S3");
-  Serial.println("============================================");
-  Serial.printf("  Model input  : %d samples\n", EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE);
-  Serial.printf("  Sampling     : %d ms (%.0f Hz)\n", SAMPLE_INTERVAL_MS, 1000.0f / SAMPLE_INTERVAL_MS);
-  Serial.printf("  Fall threshold: %.2f\n", FALL_THRESHOLD);
-  Serial.printf("  Cooldown     : %d ms\n", FALL_COOLDOWN_MS);
-  Serial.println("============================================\n");
+  Serial.println("=== Fall Detection ESP32-S3 ===");
+  Serial.printf("Threshold : %.2f | Cooldown : %dms\n\n", FALL_THRESHOLD, FALL_COOLDOWN_MS);
 
-  Serial.println("[SYS] Sistem siap. Mulai monitoring...\n");
+  if (!initMPU())
+  {
+    Serial.println("[SYS] HALT: Cek koneksi MPU6050!");
+    while (true)
+      delay(1000);
+  }
+
+  Serial.println("[SYS] Siap monitoring...\n");
 }
 
-// LOOP
+// === LOOP ===
 void loop()
 {
   unsigned long now = millis();
 
-  // --- Cooldown: tunggu dulu, tidak inference ---
+  // Cooldown setelah fall terdeteksi
   if (inCooldown)
   {
-    unsigned long elapsed = now - lastFallTime;
-    if (elapsed >= FALL_COOLDOWN_MS)
+    if (now - lastFallTime >= FALL_COOLDOWN_MS)
     {
       inCooldown = false;
-      Serial.println("[SYS] Cooldown selesai → kembali monitoring...\n");
+      Serial.println("[SYS] Cooldown selesai\n");
+    }
+    else
+    {
+      delay(SAMPLE_INTERVAL_MS);
+      return;
     }
   }
 
-  // --- Sampling pada interval tetap ---
+  // Sampling 50Hz
   if (now - lastSampleTime < SAMPLE_INTERVAL_MS)
     return;
   lastSampleTime = now;
 
-  // --- Baca akselerometer ---
+  // Baca sensor
   float ax, ay, az;
-  if (!readAccelRaw(ax, ay, az))
+  if (!readAccel(ax, ay, az))
   {
-    Serial.println("[MPU] Gagal baca data!");
+    Serial.println("[MPU] Gagal baca!");
     return;
   }
 
-  // --- Isi buffer ---
+  // Isi buffer
   input_buffer[input_ix++] = ax;
   input_buffer[input_ix++] = ay;
   input_buffer[input_ix++] = az;
 
-  // --- Jalankan inferensi jika buffer penuh ---
+  // Jalankan inferensi jika buffer penuh
   if (input_ix >= EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE)
   {
     runInference();
